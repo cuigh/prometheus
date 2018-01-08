@@ -23,6 +23,7 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/prometheus/discovery/swarm"
 
 	sd_config "github.com/prometheus/prometheus/discovery/config"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
@@ -374,6 +375,11 @@ func (m *Manager) registerProviders(cfg sd_config.ServiceDiscoveryConfig, setNam
 	for _, c := range cfg.ServersetSDConfigs {
 		add(c, func() (Discoverer, error) {
 			return zookeeper.NewServersetDiscovery(c, log.With(m.logger, "discovery", "zookeeper"))
+		})
+	}
+	for _, c := range cfg.SwarmSDConfigs {
+		add(c, func() (Discoverer, error) {
+			return swarm.NewDiscovery(*c, log.With(m.logger, "discovery", "swarm"))
 		})
 	}
 	for _, c := range cfg.NerveSDConfigs {
