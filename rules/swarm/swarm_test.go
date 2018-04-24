@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package swarm
+package rules
 
 import (
 	"context"
@@ -19,26 +19,37 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"testing"
 
-	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/util/testutil"
+	"strconv"
 )
 
 var (
 	testService = "prometheus"
+	alertingRule = &RuleConfig{
+		Alert: "TestAlert",
+		Expr: "testAlertExpr",
+		For: "15s",
+		Labels:  map[string]string { "traefik.network": "traefik-front" },
+		Annotations:  map[string]string { "description": "Test Alert" },
+	}
+	recordRule = &RuleConfig{
+		Record: "TestRecord",
+		Expr: "testRecordExpr",
+		Labels:  map[string]string { "traefik.network": "traefik-front" },
+		Annotations:  map[string]string { "description": "Test record" },
+	}
 )
 
 type testSwarmServer struct {
 	err        string
 	apiVersion string
-	taskCount  int
+	rule  *RuleConfig
 	*httptest.Server
 }
 
-func newTestServer(apiVersion string, err string, taskCount int) *testSwarmServer {
+func newTestServer(apiVersion string, err string, rule *RuleConfig) *testSwarmServer {
 	const (
 		nodeID      = "1"
 		networkName = "monitor"
@@ -48,7 +59,7 @@ func newTestServer(apiVersion string, err string, taskCount int) *testSwarmServe
 	s := &testSwarmServer{
 		err:        err,
 		apiVersion: apiVersion,
-		taskCount:  taskCount,
+		rule:  rule,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc(fmt.Sprintf("/v%s/nodes", s.apiVersion), func(w http.ResponseWriter, r *http.Request) {
@@ -78,6 +89,14 @@ func newTestServer(apiVersion string, err string, taskCount int) *testSwarmServe
 			labelPrefix + "port":    "9090",
 			labelPrefix + "network": networkName,
 		}
+		if s.rule != nil {
+			b, err := json.Marshal(s.rule)
+			if err != nil {
+				http.Error(w, fmt.Sprintf("json.Marshal error: %s ", err), http.StatusInternalServerError)
+				return
+			}
+			service.Spec.Labels[labelPrefix + "rules.TestAlert"] = string(b)
+		}
 		service.Spec.TaskTemplate.ContainerSpec.Image = image
 		json.NewEncoder(w).Encode([]Service{service})
 	})
@@ -88,7 +107,7 @@ func newTestServer(apiVersion string, err string, taskCount int) *testSwarmServe
 		}
 
 		var tasks []Task
-		for i := 0; i < s.taskCount; i++ {
+		for i := 0; i < 2; i++ {
 			t := Task{
 				ID:     strconv.Itoa(i + 1),
 				NodeID: nodeID,
@@ -111,7 +130,7 @@ func newTestServer(apiVersion string, err string, taskCount int) *testSwarmServe
 	return s
 }
 
-func testUpdateServices(s *testSwarmServer, ch chan []*targetgroup.Group) error {
+func testUpdateServices(s *testSwarmServer, ch chan []*RuleGroupConfig) error {
 	conf := SDConfig{APIServer: s.URL}
 	md, err := NewDiscovery(conf, nil)
 	if err != nil {
@@ -123,8 +142,8 @@ func testUpdateServices(s *testSwarmServer, ch chan []*targetgroup.Group) error 
 func TestSwarmSDHandleError(t *testing.T) {
 	const testError = "testing failure"
 
-	ch := make(chan []*targetgroup.Group, 1)
-	s := newTestServer(apiVersion, testError, 0)
+	ch := make(chan []*RuleGroupConfig, 1)
+	s := newTestServer(apiVersion, testError, alertingRule)
 	defer s.Close()
 
 	err := testUpdateServices(s, ch)
@@ -138,8 +157,8 @@ func TestSwarmSDHandleError(t *testing.T) {
 }
 
 func TestSwarmSDEmptyList(t *testing.T) {
-	ch := make(chan []*targetgroup.Group, 1)
-	s := newTestServer(apiVersion, "", 0)
+	ch := make(chan []*RuleGroupConfig, 1)
+	s := newTestServer(apiVersion, "", nil)
 	defer s.Close()
 
 	err := testUpdateServices(s, ch)
@@ -155,42 +174,42 @@ func TestSwarmSDEmptyList(t *testing.T) {
 }
 
 func TestSwarmSDSendGroup(t *testing.T) {
-	ch := make(chan []*targetgroup.Group, 1)
-	s := newTestServer(apiVersion, "", 1)
+	ch := make(chan []*RuleGroupConfig, 1)
+	s := newTestServer(apiVersion, "", alertingRule)
 	defer s.Close()
 
 	err := testUpdateServices(s, ch)
 	testutil.Ok(t, err)
 
 	select {
-	case tgs := <-ch:
-		tg := tgs[0]
-		testutil.Assert(t, tg.Source == testService, "Wrong target group name: %s", tg.Source)
+	case rgs := <-ch:
+		rg := rgs[0]
+		testutil.Assert(t, rg.Name == testService, "Wrong rule group name: %s", rg.Name)
 
-		tar := tg.Targets[0]
-		testutil.Assert(t, tar[model.AddressLabel] == "10.0.2.10:9090", "Wrong target address: %s", tar[model.AddressLabel])
-		testutil.Assert(t, tar[model.LabelName(nodeIPLabel)] == "192.168.1.100", "Wrong node_ip: %s", tar[model.LabelName(nodeIPLabel)])
-		testutil.Assert(t, tar[model.LabelName(nodeNameLabel)] == "docker-01", "Wrong node_name: %s", tar[model.LabelName(nodeNameLabel)])
+		rule := rg.Rules[0]
+		testutil.Assert(t, rule.Alert == alertingRule.Alert, "Wrong alert name: %s", rule.Alert)
 	default:
-		t.Fatal("Did not get a target group.")
+		t.Fatal("Did not get a rule group.")
 	}
 }
 
-func TestSwarmSDRemoveTask(t *testing.T) {
-	ch := make(chan []*targetgroup.Group, 1)
-	s := newTestServer(apiVersion, "", 2)
+func TestSwarmSDChangeRule(t *testing.T) {
+	ch := make(chan []*RuleGroupConfig, 1)
+	s := newTestServer(apiVersion, "", alertingRule)
 	defer s.Close()
 
 	err := testUpdateServices(s, ch)
 	testutil.Ok(t, err)
 	up1 := (<-ch)[0]
-	testutil.Assert(t, len(up1.Targets) == s.taskCount, "Expected %v targets, got %v", s.taskCount, len(up1.Targets))
+	testutil.Assert(t, len(up1.Rules) == 1, "Expected %v targets, got %v", 1, len(up1.Rules))
 
-	s.taskCount = 1
+	s.rule = recordRule
 	err = testUpdateServices(s, ch)
 	testutil.Ok(t, err)
 	up2 := (<-ch)[0]
-	testutil.Assert(t, len(up2.Targets) == s.taskCount, "Expected %v targets, got %v", s.taskCount, len(up2.Targets))
+	testutil.Assert(t, len(up2.Rules) == 1, "Expected %v targets, got %v", 1, len(up2.Rules))
 
-	testutil.Assert(t, up1.Source == up2.Source, "Source is different: %s", up2)
+	testutil.Assert(t, up1.Name == up2.Name, "Name is different: %s", up2)
+
+	testutil.Assert(t, up1.Rules[0].Expr != up2.Rules[0].Expr, "Expr is not different: %s", up2)
 }

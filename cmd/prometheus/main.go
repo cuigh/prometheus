@@ -334,6 +334,16 @@ func main() {
 				}
 				files = append(files, fs...)
 			}
+			c := make(map[string]sd_config.ServiceDiscoveryConfig)
+			for _, v := range cfg.ScrapeConfigs {
+				c[v.JobName] = v.ServiceDiscoveryConfig
+			}
+
+			errSD := ruleManager.ApplyDiscoveryConfig(time.Duration(cfg.GlobalConfig.EvaluationInterval), c)
+			if errSD != nil {
+				return errSD
+			}
+
 			return ruleManager.Update(time.Duration(cfg.GlobalConfig.EvaluationInterval), files)
 		},
 	}
