@@ -29,12 +29,14 @@ import (
 	"github.com/go-kit/kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 
+	sd_config "github.com/prometheus/prometheus/discovery/config"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/rulefmt"
 	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/prometheus/prometheus/pkg/value"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/prometheus/prometheus/rules/swarm"
 )
 
 // Constants for instrumentation.
@@ -409,6 +411,7 @@ type Manager struct {
 	groups map[string]*Group
 	mtx    sync.RWMutex
 	block  chan struct{}
+	discoverCancel []context.CancelFunc
 
 	logger log.Logger
 }
@@ -439,6 +442,7 @@ func NewManager(o *ManagerOptions) *Manager {
 		groups: map[string]*Group{},
 		opts:   o,
 		block:  make(chan struct{}),
+		discoverCancel: []context.CancelFunc{},
 		logger: o.Logger,
 	}
 	if o.Registerer != nil {
@@ -464,6 +468,189 @@ func (m *Manager) Stop() {
 	}
 
 	level.Info(m.logger).Log("msg", "Rule manager stopped")
+}
+
+// Discoverer provides information about rule groups. It maintains a set
+// of sources from which RuleGroups can originate. Whenever a discovery provider
+// detects a potential change, it sends the RuleGroup through its channel.
+//
+// Discoverer does not know if an actual change happened.
+// It does guarantee that it sends the new RuleGroup whenever a change happens.
+//
+// Discoverers should initially send a full set of all discoverable RuleGroups.
+type Discoverer interface {
+	// Run hands a channel to the discovery provider(swarm,consul,dns etc) through which it can send
+	// updated rule groups.
+	// Must returns if the context gets canceled. It should not close the update
+	// channel on returning.
+	Run(ctx context.Context, up chan<- []*rules.RuleGroupConfig)
+	// Identifier
+	File() string
+}
+
+// ApplyConfig removes all running discovery providers and starts new ones using the provided config.
+func (m *Manager) ApplyDiscoveryConfig(interval time.Duration, cfg map[string]sd_config.ServiceDiscoveryConfig) error {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+
+	m.cancelDiscoverers()
+	for _, scfg := range cfg {
+		for _, prov := range m.providersFromConfig(scfg) {
+			m.startProvider(interval, m.opts.Context, prov)
+		}
+	}
+
+	return nil
+}
+
+func (m *Manager) providersFromConfig(cfg sd_config.ServiceDiscoveryConfig) map[string]Discoverer {
+	providers := map[string]Discoverer{}
+
+	app := func(mech string, i int, tp Discoverer) {
+		providers[fmt.Sprintf("%s/%d", mech, i)] = tp
+	}
+
+	for i, c := range cfg.SwarmSDConfigs {
+		config := rules.SDConfig{
+			APIServer:c.APIServer,
+			APIVersion: c.APIVersion,
+			Group: c.Group,
+			Network: c.Network,
+			Timeout: c.Timeout,
+			RefreshInterval: c.RefreshInterval,
+			XXX: c.XXX,
+		}
+		d, err := rules.NewDiscovery(config, log.With(m.logger, "discovery", "swarm"))
+		if err != nil {
+			level.Error(m.logger).Log("msg", "Cannot create Swarm discovery", "err", err)
+			continue
+		}
+		app("swarm", i, d)
+	}
+
+	return providers
+}
+
+func (m *Manager) startProvider(interval time.Duration, ctx context.Context, worker Discoverer) {
+	ctx, cancel := context.WithCancel(ctx)
+	updates := make(chan []*rules.RuleGroupConfig)
+
+	m.discoverCancel = append(m.discoverCancel, cancel)
+
+	go worker.Run(ctx, updates)
+	go m.runProvider(interval, worker.File(), ctx, updates)
+}
+
+func (m *Manager) runProvider(interval time.Duration, fn string, ctx context.Context, updates chan []*rules.RuleGroupConfig) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case rgs, ok := <-updates:
+			// Handle the case that a target provider exits and closes the channel
+			// before the context is done.
+			if !ok {
+				return
+			}
+
+			groups := make(map[string]*Group)
+			for _, rg := range rgs {
+				itv := interval
+				if rg.Interval != 0 {
+					itv = time.Duration(rg.Interval)
+				}
+
+				rules := make([]Rule, 0, len(rg.Rules))
+				for _, r := range rg.Rules {
+					expr, err := promql.ParseExpr(r.Expr)
+					if err != nil {
+						return
+					}
+
+					if r.Alert != "" {
+						ruleFor, errFor := time.ParseDuration(r.For)
+						if errFor != nil {
+							return
+						}
+						rules = append(rules, NewAlertingRule(
+							r.Alert,
+							expr,
+							ruleFor,
+							labels.FromMap(r.Labels),
+							labels.FromMap(r.Annotations),
+							log.With(m.logger, "alert", r.Alert),
+						))
+						continue
+					}
+					rules = append(rules, NewRecordingRule(
+						r.Record,
+						expr,
+						labels.FromMap(r.Labels),
+					))
+				}
+
+				groups[groupKey(rg.Name, fn)] = NewGroup(rg.Name, fn, itv, rules, m.opts)
+			}
+			m.UpdateFromDiscovery(interval, groups)
+		}
+	}
+}
+
+func (m *Manager) cancelDiscoverers() {
+	for _, c := range m.discoverCancel {
+		c()
+	}
+	m.discoverCancel = nil
+}
+
+// Update the rule manager's state as the discovery manager requires. If
+// loading the new rules failed the old rule set is restored.
+func (m *Manager) UpdateFromDiscovery(interval time.Duration, groups map[string]*Group) error {
+	m.mtx.Lock()
+	defer m.mtx.Unlock()
+
+	var wg sync.WaitGroup
+	var fnFromDiscovery = make(map[string]bool)
+
+	for _, newg := range groups {
+		fnFromDiscovery[newg.file] = true
+		wg.Add(1)
+
+		// If there is an old group with the same identifier, stop it and wait for
+		// it to finish the current iteration. Then copy it into the new group.
+		gn := groupKey(newg.name, newg.file)
+		oldg, ok := m.groups[gn]
+		delete(m.groups, gn)
+
+		go func(newg *Group) {
+			if ok {
+				oldg.stop()
+				newg.copyState(oldg)
+			}
+			go func() {
+				// Wait with starting evaluation until the rule manager
+				// is told to run. This is necessary to avoid running
+				// queries against a bootstrapping storage.
+				<-m.block
+				newg.run(m.opts.Context)
+			}()
+			wg.Done()
+		}(newg)
+	}
+
+	// Stop remaining old groups from discovery.
+	for gn, oldg := range m.groups {
+		if _, ok := fnFromDiscovery[oldg.file]; ok {
+			oldg.stop()
+		} else {
+			groups[gn] = oldg
+		}
+	}
+
+	wg.Wait()
+	m.groups = groups
+
+	return nil
 }
 
 // Update the rule manager's state as the config requires. If
