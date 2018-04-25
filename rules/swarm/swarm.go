@@ -32,6 +32,8 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/util/yaml"
 	"regexp"
+	"text/template"
+	"bytes"
 )
 
 const (
@@ -241,6 +243,10 @@ func (d *Discovery) fetchRuleGroups() (map[string]*RuleGroupConfig, error) {
 	return groups, nil
 }
 
+type RuleExprObject struct {
+	Service string
+}
+
 func (d *Discovery) createRuleGroup(service *Service, nodes map[string]*Node) *RuleGroupConfig {
 
 	ruleLabels := make(map[string]string)
@@ -252,6 +258,10 @@ func (d *Discovery) createRuleGroup(service *Service, nodes map[string]*Node) *R
 		}
 	}
 
+	ruleExprObject := RuleExprObject{
+		Service: service.Spec.Name,
+	}
+
 	ruleList := make([]RuleConfig, 0, len(ruleLabels))
 	for _, ruleJSON := range ruleLabels {
 		r := RuleConfig{}
@@ -259,7 +269,19 @@ func (d *Discovery) createRuleGroup(service *Service, nodes map[string]*Node) *R
 		if err != nil {
 			continue
 		}
+		tmpl, err := template.New("expr").Parse(r.Expr)
+		if err != nil {
+			level.Error(d.logger).Log("msg", "Error while parsing rule expr template", "err", err, "service", service.Spec.Name)
+			continue
+		}
+		var buffer bytes.Buffer
+		err = tmpl.Execute(&buffer, ruleExprObject)
 
+		if err != nil {
+			level.Error(d.logger).Log("msg", "Error while executing rule expr template", "err", err, "service", service.Spec.Name)
+			continue
+		}
+		r.Expr = buffer.String()
 		ruleList = append(ruleList, r)
 	}
 

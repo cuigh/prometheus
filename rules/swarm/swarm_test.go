@@ -29,14 +29,14 @@ var (
 	testService = "prometheus"
 	alertingRule = &RuleConfig{
 		Alert: "TestAlert",
-		Expr: "testAlertExpr",
+		Expr: "testAlertExpr {{.Service}}",
 		For: "15s",
 		Labels:  map[string]string { "traefik.network": "traefik-front" },
 		Annotations:  map[string]string { "description": "Test Alert" },
 	}
 	recordRule = &RuleConfig{
 		Record: "TestRecord",
-		Expr: "testRecordExpr",
+		Expr: "testRecordExpr {{.Service}}",
 		Labels:  map[string]string { "traefik.network": "traefik-front" },
 		Annotations:  map[string]string { "description": "Test record" },
 	}
@@ -185,6 +185,7 @@ func TestSwarmSDSendGroup(t *testing.T) {
 	case rgs := <-ch:
 		rg := rgs[0]
 		testutil.Assert(t, rg.Name == testService, "Wrong rule group name: %s", rg.Name)
+		testutil.Assert(t, rg.Rules[0].Expr == "testAlertExpr " + testService, "Wrong rule expr: %s", rg.Rules[0].Expr)
 
 		rule := rg.Rules[0]
 		testutil.Assert(t, rule.Alert == alertingRule.Alert, "Wrong alert name: %s", rule.Alert)
