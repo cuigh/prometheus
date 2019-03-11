@@ -369,7 +369,6 @@ func (d *Discovery) targetsForService(service *Service, nodes map[string]*Node) 
 
 			addr := d.getTaskAddr(&t, network, node)
 			if addr != "" {
-				// DEBUG
 				target := model.LabelSet{
 					model.AddressLabel: model.LabelValue(net.JoinHostPort(addr, port)),
 					taskLabel:          model.LabelValue(t.ID),
