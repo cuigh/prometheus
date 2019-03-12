@@ -61,6 +61,8 @@ const (
 	apiVersion = "1.32"
 	// labelPrefix is the prefix of service labels used for filtering in this discovery.
 	labelPrefix = "prometheus."
+	// labelPrefixServiceRole is the prefix of service labels used for filtering in this discovery.
+	labelPrefixServiceRole = "prometheus.service."
 )
 
 var (
@@ -223,30 +225,46 @@ func (d *Discovery) updateServices(ctx context.Context, ch chan<- []*targetgroup
 }
 
 func (d *Discovery) fetchTargetGroups() (map[string]*targetgroup.Group, error) {
-	services, err := d.fetchServices()
-	if err != nil {
-		return nil, err
-	}
-
 	nodes, err := d.fetchNodes()
 	if err != nil {
 		return nil, err
 	}
 
 	groups := map[string]*targetgroup.Group{}
+
+	// Fetch services for tasks
+	services, err := d.fetchServices(labelPrefix)
+	if err != nil {
+		return nil, err
+	}
+
 	for _, service := range services {
 		if len(service.Tasks) > 0 {
-			group := d.createTargetGroup(service, nodes)
+			group := d.createTargetGroup(labelPrefix, service, nodes)
 			groups[group.Source] = group
 		}
 	}
+
+	// Fetch services in service Role
+	services, err = d.fetchServices(labelPrefixServiceRole)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, service := range services {
+		if len(service.Tasks) > 0 {
+			group := d.createTargetGroup(labelPrefixServiceRole, service, nodes)
+			groups[group.Source] = group
+		}
+	}
+
 	return groups, nil
 }
 
-func (d *Discovery) createTargetGroup(service *Service, nodes map[string]*Node) *targetgroup.Group {
+func (d *Discovery) createTargetGroup(prefix string, service *Service, nodes map[string]*Node) *targetgroup.Group {
 	g := &targetgroup.Group{
-		Source:  service.Spec.Name,
-		Targets: d.targetsForService(service, nodes),
+		Source:  prefix + service.Spec.Name,
+		Targets: d.targetsForService(prefix, service, nodes),
 		Labels: model.LabelSet{
 			serviceLabel: model.LabelValue(service.Spec.Name),
 			imageLabel:   model.LabelValue(service.Spec.TaskTemplate.ContainerSpec.Image),
@@ -260,9 +278,9 @@ func (d *Discovery) createTargetGroup(service *Service, nodes map[string]*Node) 
 }
 
 // fetchServices requests a list of services from Swarm cluster.
-func (d *Discovery) fetchServices() ([]*Service, error) {
+func (d *Discovery) fetchServices(prefix string) ([]*Service, error) {
 	filters := Args{}
-	filters.Add("label", labelPrefix+"enable=true")
+	filters.Add("label", prefix+"enable=true")
 	body, err := d.request("/services", filters)
 	if err != nil {
 		return nil, err
@@ -317,7 +335,7 @@ func (d *Discovery) fetchNodes() (map[string]*Node, error) {
 	return m, nil
 }
 
-// fetchServices requests a list of services from Swarm cluster.
+// request requests a list of services from Swarm cluster.
 func (d *Discovery) request(path string, args Args) ([]byte, error) {
 	filters, err := args.ToJSON()
 	if err != nil {
@@ -350,31 +368,46 @@ func (d *Discovery) request(path string, args Args) ([]byte, error) {
 	return body, nil
 }
 
-func (d *Discovery) targetsForService(service *Service, nodes map[string]*Node) []model.LabelSet {
+func (d *Discovery) targetsForService(prefix string, service *Service, nodes map[string]*Node) []model.LabelSet {
 	targets := make([]model.LabelSet, 0, len(service.Tasks))
-	network := service.Spec.Labels[labelPrefix+"network"]
+	network := service.Spec.Labels[prefix+"network"]
 	if network == "" {
 		network = d.network
 	}
-	port := service.Spec.Labels[labelPrefix+"port"]
-	path := service.Spec.Labels[labelPrefix+"path"]
-	group := service.Spec.Labels[labelPrefix+"group"]
-	//scheme := service.Spec.Labels[labelPrefix+"scheme"]
+	port := service.Spec.Labels[prefix+"port"]
+	path := service.Spec.Labels[prefix+"path"]
+	group := service.Spec.Labels[prefix+"group"]
+	//scheme := service.Spec.Labels[prefix+"scheme"]
 	if port != "" && group == d.group {
-		for _, t := range service.Tasks {
-			node, ok := nodes[t.NodeID]
-			if !ok {
-				continue
-			}
+		if prefix == labelPrefix {
+			// Pod mode, we retrieve tasks for targets
+			for _, t := range service.Tasks {
+				node, ok := nodes[t.NodeID]
+				if !ok {
+					continue
+				}
 
-			addr := d.getTaskAddr(&t, network, node)
+				addr := d.getTaskAddr(&t, network, node)
+				if addr != "" {
+					target := model.LabelSet{
+						model.AddressLabel: model.LabelValue(net.JoinHostPort(addr, port)),
+						taskLabel:          model.LabelValue(t.ID),
+						nodeIPLabel:        model.LabelValue(d.getNodeIP(node)),
+						nodeNameLabel:      model.LabelValue(d.getNodeName(node)),
+						taskSlotLabel:      model.LabelValue(strconv.Itoa(t.Slot)),
+					}
+					if path != "" {
+						target[model.MetricsPathLabel] = model.LabelValue(path)
+					}
+					targets = append(targets, target)
+				}
+			}
+		} else {
+			// Service mode, we only get the VIP as target
+			addr := d.getServiceAddr(service, network)
 			if addr != "" {
 				target := model.LabelSet{
 					model.AddressLabel: model.LabelValue(net.JoinHostPort(addr, port)),
-					taskLabel:          model.LabelValue(t.ID),
-					nodeIPLabel:        model.LabelValue(d.getNodeIP(node)),
-					nodeNameLabel:      model.LabelValue(d.getNodeName(node)),
-					taskSlotLabel:      model.LabelValue(strconv.Itoa(t.Slot)),
 				}
 				if path != "" {
 					target[model.MetricsPathLabel] = model.LabelValue(path)
@@ -384,6 +417,33 @@ func (d *Discovery) targetsForService(service *Service, nodes map[string]*Node) 
 		}
 	}
 	return targets
+}
+
+func (d *Discovery) getServiceAddr(s *Service, network string) string {
+	if len(s.Spec.TaskTemplate.Networks) > 0 {
+		var networkID = ""
+		for _, n := range s.Spec.TaskTemplate.Networks {
+			for _, a := range n.Aliases {
+				if a == network {
+					networkID = n.Target
+					break
+				}
+			}
+		}
+		if networkID == "" {
+			// use first network as default
+			networkID = s.Spec.TaskTemplate.Networks[0].Target
+		}
+		// Get vip on that network
+		if len(s.Endpoint.VirtualIPs) > 0 {
+			for _, n := range s.Endpoint.VirtualIPs {
+				if n.NetworkID == networkID {
+					return strings.Split(n.Addr, "/")[0]
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func (d *Discovery) getTaskAddr(t *Task, network string, node *Node) string {
@@ -425,12 +485,22 @@ func (d *Discovery) getNodeName(n *Node) string {
 
 // Service describes one instance of a service running on Swarm.
 type Service struct {
+	Endpoint struct {
+		VirtualIPs []struct {
+			Addr      string
+			NetworkID string
+		}
+	}
 	Spec struct {
 		Name         string
 		Labels       map[string]string
 		TaskTemplate struct {
 			ContainerSpec struct {
 				Image string
+			}
+			Networks []struct {
+				Aliases []string
+				Target  string
 			}
 		}
 	}
