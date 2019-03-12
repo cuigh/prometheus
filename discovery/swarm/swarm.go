@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -50,6 +51,8 @@ const (
 	nodeIPLabel model.LabelName = metaLabelPrefix + "node_ip"
 	// nodeNameLabel contains the node name.
 	nodeNameLabel model.LabelName = metaLabelPrefix + "node_name"
+	// slotLabel contains the task slot.
+	taskSlotLabel model.LabelName = metaLabelPrefix + "task_slot"
 
 	// Constants for instrumentation.
 	namespace = "prometheus"
@@ -371,6 +374,7 @@ func (d *Discovery) targetsForService(service *Service, nodes map[string]*Node) 
 					taskLabel:          model.LabelValue(t.ID),
 					nodeIPLabel:        model.LabelValue(d.getNodeIP(node)),
 					nodeNameLabel:      model.LabelValue(d.getNodeName(node)),
+					taskSlotLabel:      model.LabelValue(strconv.Itoa(t.Slot)),
 				}
 				if path != "" {
 					target[model.MetricsPathLabel] = model.LabelValue(path)
@@ -450,6 +454,7 @@ type Task struct {
 		}
 		Addresses []string
 	}
+	Slot int
 }
 
 // Node is an instance of the Engine participating in a swarm.
