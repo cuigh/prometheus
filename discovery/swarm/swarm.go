@@ -317,7 +317,7 @@ func (d *Discovery) fetchNodes() (map[string]*Node, error) {
 	return m, nil
 }
 
-// fetchServices requests a list of services from Swarm cluster.
+// request requests a list of services from Swarm cluster.
 func (d *Discovery) request(path string, args Args) ([]byte, error) {
 	filters, err := args.ToJSON()
 	if err != nil {
@@ -356,34 +356,77 @@ func (d *Discovery) targetsForService(service *Service, nodes map[string]*Node) 
 	if network == "" {
 		network = d.network
 	}
+	mode := service.Spec.Labels[labelPrefix+"mode"]
 	port := service.Spec.Labels[labelPrefix+"port"]
 	path := service.Spec.Labels[labelPrefix+"path"]
 	group := service.Spec.Labels[labelPrefix+"group"]
 	//scheme := service.Spec.Labels[labelPrefix+"scheme"]
 	if port != "" && group == d.group {
-		for _, t := range service.Tasks {
-			node, ok := nodes[t.NodeID]
-			if !ok {
-				continue
-			}
-
-			addr := d.getTaskAddr(&t, network, node)
+		if mode == "service" {
+			// Service mode, we only get the VIP as target
+			addr := d.getServiceAddr(service, network)
 			if addr != "" {
 				target := model.LabelSet{
 					model.AddressLabel: model.LabelValue(net.JoinHostPort(addr, port)),
-					taskLabel:          model.LabelValue(t.ID),
-					nodeIPLabel:        model.LabelValue(d.getNodeIP(node)),
-					nodeNameLabel:      model.LabelValue(d.getNodeName(node)),
-					taskSlotLabel:      model.LabelValue(strconv.Itoa(t.Slot)),
 				}
 				if path != "" {
 					target[model.MetricsPathLabel] = model.LabelValue(path)
 				}
 				targets = append(targets, target)
 			}
+		} else {
+			// Task mode, we retrieve tasks for targets
+			for _, t := range service.Tasks {
+				node, ok := nodes[t.NodeID]
+				if !ok {
+					continue
+				}
+
+				addr := d.getTaskAddr(&t, network, node)
+				if addr != "" {
+					target := model.LabelSet{
+						model.AddressLabel: model.LabelValue(net.JoinHostPort(addr, port)),
+						taskLabel:          model.LabelValue(t.ID),
+						nodeIPLabel:        model.LabelValue(d.getNodeIP(node)),
+						nodeNameLabel:      model.LabelValue(d.getNodeName(node)),
+						taskSlotLabel:      model.LabelValue(strconv.Itoa(t.Slot)),
+					}
+					if path != "" {
+						target[model.MetricsPathLabel] = model.LabelValue(path)
+					}
+					targets = append(targets, target)
+				}
+			}
 		}
 	}
 	return targets
+}
+
+func (d *Discovery) getServiceAddr(s *Service, network string) string {
+	if len(s.Spec.TaskTemplate.Networks) > 0 {
+		var networkID = ""
+		for _, n := range s.Spec.TaskTemplate.Networks {
+			for _, a := range n.Aliases {
+				if a == network {
+					networkID = n.Target
+					break
+				}
+			}
+		}
+		if networkID == "" {
+			// use first network as default
+			networkID = s.Spec.TaskTemplate.Networks[0].Target
+		}
+		// Get vip on that network
+		if len(s.Endpoint.VirtualIPs) > 0 {
+			for _, n := range s.Endpoint.VirtualIPs {
+				if n.NetworkID == networkID {
+					return strings.Split(n.Addr, "/")[0]
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func (d *Discovery) getTaskAddr(t *Task, network string, node *Node) string {
@@ -425,12 +468,22 @@ func (d *Discovery) getNodeName(n *Node) string {
 
 // Service describes one instance of a service running on Swarm.
 type Service struct {
+	Endpoint struct {
+		VirtualIPs []struct {
+			Addr      string
+			NetworkID string
+		}
+	}
 	Spec struct {
 		Name         string
 		Labels       map[string]string
 		TaskTemplate struct {
 			ContainerSpec struct {
 				Image string
+			}
+			Networks []struct {
+				Aliases []string
+				Target  string
 			}
 		}
 	}
