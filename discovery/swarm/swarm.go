@@ -233,20 +233,25 @@ func (d *Discovery) fetchTargetGroups() (map[string]*targetgroup.Group, error) {
 		return nil, err
 	}
 
+	networks, err := d.fetchNetworks()
+	if err != nil {
+                return nil, err
+        }
+
 	groups := map[string]*targetgroup.Group{}
 	for _, service := range services {
 		if len(service.Tasks) > 0 {
-			group := d.createTargetGroup(service, nodes)
+			group := d.createTargetGroup(service, nodes, networks)
 			groups[group.Source] = group
 		}
 	}
 	return groups, nil
 }
 
-func (d *Discovery) createTargetGroup(service *Service, nodes map[string]*Node) *targetgroup.Group {
+func (d *Discovery) createTargetGroup(service *Service, nodes map[string]*Node, networks map[string]*Network) *targetgroup.Group {
 	g := &targetgroup.Group{
 		Source:  service.Spec.Name,
-		Targets: d.targetsForService(service, nodes),
+		Targets: d.targetsForService(service, nodes, networks),
 		Labels: model.LabelSet{
 			serviceLabel: model.LabelValue(service.Spec.Name),
 			imageLabel:   model.LabelValue(service.Spec.TaskTemplate.ContainerSpec.Image),
@@ -317,6 +322,27 @@ func (d *Discovery) fetchNodes() (map[string]*Node, error) {
 	return m, nil
 }
 
+// fetchNetworks requests a list of networks.
+func (d *Discovery) fetchNetworks() (map[string]*Network, error) {
+        filters := Args{}
+        body, err := d.request("/networks", filters)
+        if err != nil {
+                return nil, err
+        }
+
+        networks := make([]*Network, 0)
+        err = json.Unmarshal(body, &networks)
+        if err != nil {
+                return nil, err
+        }
+
+        m := make(map[string]*Network)
+        for _, network := range networks {
+                m[network.Name] = network
+        }
+        return m, nil
+}
+
 // request requests a list of services from Swarm cluster.
 func (d *Discovery) request(path string, args Args) ([]byte, error) {
 	filters, err := args.ToJSON()
@@ -350,7 +376,7 @@ func (d *Discovery) request(path string, args Args) ([]byte, error) {
 	return body, nil
 }
 
-func (d *Discovery) targetsForService(service *Service, nodes map[string]*Node) []model.LabelSet {
+func (d *Discovery) targetsForService(service *Service, nodes map[string]*Node, networks map[string]*Network) []model.LabelSet {
 	targets := make([]model.LabelSet, 0, len(service.Tasks))
 	network := service.Spec.Labels[labelPrefix+"network"]
 	if network == "" {
@@ -364,7 +390,7 @@ func (d *Discovery) targetsForService(service *Service, nodes map[string]*Node) 
 	if port != "" && group == d.group {
 		if mode == "service" {
 			// Service mode, we only get the VIP as target
-			addr := d.getServiceAddr(service, network)
+			addr := d.getServiceAddr(service, network, networks)
 			if addr != "" {
 				target := model.LabelSet{
 					model.AddressLabel: model.LabelValue(net.JoinHostPort(addr, port)),
@@ -402,22 +428,9 @@ func (d *Discovery) targetsForService(service *Service, nodes map[string]*Node) 
 	return targets
 }
 
-func (d *Discovery) getServiceAddr(s *Service, network string) string {
-	if len(s.Spec.TaskTemplate.Networks) > 0 {
-		var networkID = ""
-		for _, n := range s.Spec.TaskTemplate.Networks {
-			for _, a := range n.Aliases {
-				if a == network {
-					networkID = n.Target
-					break
-				}
-			}
-		}
-		if networkID == "" {
-			// use first network as default
-			networkID = s.Spec.TaskTemplate.Networks[0].Target
-		}
-		// Get vip on that network
+func (d *Discovery) getServiceAddr(s *Service, network string, networks map[string]*Network) string {
+	networkID := networks[network].ID
+	if networkID != "" {
 		if len(s.Endpoint.VirtualIPs) > 0 {
 			for _, n := range s.Endpoint.VirtualIPs {
 				if n.NetworkID == networkID {
@@ -525,6 +538,12 @@ type Node struct {
 	Description struct {
 		Hostname string
 	}
+}
+
+// Network describe one instance of a docker network
+type Network struct {
+	ID string
+	Name string
 }
 
 // Args stores a mapping of keys to a set of multiple values.
