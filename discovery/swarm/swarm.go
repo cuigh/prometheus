@@ -233,25 +233,20 @@ func (d *Discovery) fetchTargetGroups() (map[string]*targetgroup.Group, error) {
 		return nil, err
 	}
 
-	networks, err := d.fetchNetworks()
-	if err != nil {
-                return nil, err
-        }
-
 	groups := map[string]*targetgroup.Group{}
 	for _, service := range services {
 		if len(service.Tasks) > 0 {
-			group := d.createTargetGroup(service, nodes, networks)
+			group := d.createTargetGroup(service, nodes)
 			groups[group.Source] = group
 		}
 	}
 	return groups, nil
 }
 
-func (d *Discovery) createTargetGroup(service *Service, nodes map[string]*Node, networks map[string]*Network) *targetgroup.Group {
+func (d *Discovery) createTargetGroup(service *Service, nodes map[string]*Node) *targetgroup.Group {
 	g := &targetgroup.Group{
 		Source:  service.Spec.Name,
-		Targets: d.targetsForService(service, nodes, networks),
+		Targets: d.targetsForService(service, nodes),
 		Labels: model.LabelSet{
 			serviceLabel: model.LabelValue(service.Spec.Name),
 			imageLabel:   model.LabelValue(service.Spec.TaskTemplate.ContainerSpec.Image),
@@ -322,27 +317,6 @@ func (d *Discovery) fetchNodes() (map[string]*Node, error) {
 	return m, nil
 }
 
-// fetchNetworks requests a list of networks.
-func (d *Discovery) fetchNetworks() (map[string]*Network, error) {
-        filters := Args{}
-        body, err := d.request("/networks", filters)
-        if err != nil {
-                return nil, err
-        }
-
-        networks := make([]*Network, 0)
-        err = json.Unmarshal(body, &networks)
-        if err != nil {
-                return nil, err
-        }
-
-        m := make(map[string]*Network)
-        for _, network := range networks {
-                m[network.Name] = network
-        }
-        return m, nil
-}
-
 // request requests a list of services from Swarm cluster.
 func (d *Discovery) request(path string, args Args) ([]byte, error) {
 	filters, err := args.ToJSON()
@@ -376,7 +350,7 @@ func (d *Discovery) request(path string, args Args) ([]byte, error) {
 	return body, nil
 }
 
-func (d *Discovery) targetsForService(service *Service, nodes map[string]*Node, networks map[string]*Network) []model.LabelSet {
+func (d *Discovery) targetsForService(service *Service, nodes map[string]*Node) []model.LabelSet {
 	targets := make([]model.LabelSet, 0, len(service.Tasks))
 	network := service.Spec.Labels[labelPrefix+"network"]
 	if network == "" {
@@ -521,12 +495,6 @@ type Node struct {
 	Description struct {
 		Hostname string
 	}
-}
-
-// Network describe one instance of a docker network
-type Network struct {
-	ID string
-	Name string
 }
 
 // Args stores a mapping of keys to a set of multiple values.
