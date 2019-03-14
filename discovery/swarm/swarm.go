@@ -389,17 +389,14 @@ func (d *Discovery) targetsForService(service *Service, nodes map[string]*Node, 
 	//scheme := service.Spec.Labels[labelPrefix+"scheme"]
 	if port != "" && group == d.group {
 		if mode == "service" {
-			// Service mode, we only get the VIP as target
-			addr := d.getServiceAddr(service, network, networks)
-			if addr != "" {
-				target := model.LabelSet{
-					model.AddressLabel: model.LabelValue(net.JoinHostPort(addr, port)),
-				}
-				if path != "" {
-					target[model.MetricsPathLabel] = model.LabelValue(path)
-				}
-				targets = append(targets, target)
+			// Service mode, targeting the service name
+			target := model.LabelSet{
+				model.AddressLabel: model.LabelValue(net.JoinHostPort(service.Spec.Name, port)),
 			}
+			if path != "" {
+                                target[model.MetricsPathLabel] = model.LabelValue(path)
+                        }
+                        targets = append(targets, target)
 		} else {
 			// Task mode, we retrieve tasks for targets
 			for _, t := range service.Tasks {
@@ -426,20 +423,6 @@ func (d *Discovery) targetsForService(service *Service, nodes map[string]*Node, 
 		}
 	}
 	return targets
-}
-
-func (d *Discovery) getServiceAddr(s *Service, network string, networks map[string]*Network) string {
-	networkID := networks[network].ID
-	if networkID != "" {
-		if len(s.Endpoint.VirtualIPs) > 0 {
-			for _, n := range s.Endpoint.VirtualIPs {
-				if n.NetworkID == networkID {
-					return strings.Split(n.Addr, "/")[0]
-				}
-			}
-		}
-	}
-	return ""
 }
 
 func (d *Discovery) getTaskAddr(t *Task, network string, node *Node) string {
